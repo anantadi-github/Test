@@ -38,6 +38,16 @@ HLS_TIME_SEC = int(os.getenv("HLS_TIME_SEC", "2"))         # segment duration
 HLS_LIST_SIZE = int(os.getenv("HLS_LIST_SIZE", "6"))       # rolling window length
 HLS_DELETE_THRESHOLD = int(os.getenv("HLS_DELETE_THRESHOLD", "1"))
 
+# Transcoding (use when sender doesn't repeat SPS/PPS)
+VIDEO_CODEC = os.getenv("VIDEO_CODEC", "copy")  # "copy" or e.g. "libx264"
+AUDIO_CODEC = os.getenv("AUDIO_CODEC", "copy")  # "copy", "aac", or "none"
+X264_PRESET = os.getenv("X264_PRESET", "veryfast")
+X264_TUNE = os.getenv("X264_TUNE", "zerolatency")
+VIDEO_CRF = os.getenv("VIDEO_CRF", "")          # e.g. "23"
+VIDEO_BITRATE = os.getenv("VIDEO_BITRATE", "")  # e.g. "2500k"
+AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "")  # e.g. "128k"
+FORCE_KEYFRAMES = os.getenv("FORCE_KEYFRAMES", "true").lower() in ("1", "true", "yes")
+
 # SRT tuning (start here; adjust only if needed)
 SRT_LATENCY_US = int(os.getenv("SRT_LATENCY_US", "200000"))        # 200ms
 SRT_RCVBUF_BYTES = int(os.getenv("SRT_RCVBUF_BYTES", "25000000"))  # 25MB
@@ -88,9 +98,39 @@ def playlist_path() -> str:
     return os.path.join(HLS_DIR, PLAYLIST_NAME)
 
 
+def build_codec_args() -> list[str]:
+    args: list[str] = []
+
+    if VIDEO_CODEC == "copy":
+        args += ["-c:v", "copy"]
+    else:
+        args += ["-c:v", VIDEO_CODEC]
+        if VIDEO_CODEC == "libx264":
+            args += ["-preset", X264_PRESET, "-tune", X264_TUNE]
+            args += ["-x264-params", "repeat-headers=1"]
+        if VIDEO_CODEC in ("libx264", "libx265") and VIDEO_CRF:
+            args += ["-crf", VIDEO_CRF]
+        if VIDEO_BITRATE:
+            args += ["-b:v", VIDEO_BITRATE]
+        if FORCE_KEYFRAMES:
+            args += ["-force_key_frames", f"expr:gte(t,n_forced*{HLS_TIME_SEC})"]
+
+    audio_codec = AUDIO_CODEC.lower()
+    if audio_codec in ("none", "disable", "disabled", "no"):
+        args += ["-an"]
+    elif audio_codec == "copy":
+        args += ["-c:a", "copy"]
+    else:
+        args += ["-c:a", AUDIO_CODEC]
+        if AUDIO_BITRATE:
+            args += ["-b:a", AUDIO_BITRATE]
+
+    return args
+
+
 def build_ffmpeg_cmd() -> list[str]:
     """
-    Copy-only repackaging: SRT listener -> HLS
+    Repackage (or transcode) SRT listener -> HLS
     """
     # SRT listener URL
     srt_in = (
@@ -119,10 +159,9 @@ def build_ffmpeg_cmd() -> list[str]:
         "-fflags", "+genpts",
 
         "-i", srt_in,
-
-        # CRITICAL: no transcoding (keeps CPU low)
-        "-c", "copy",
-
+    ]
+    cmd += build_codec_args()
+    cmd += [
         "-f", "hls",
         "-hls_time", str(HLS_TIME_SEC),
         "-hls_list_size", str(HLS_LIST_SIZE),
