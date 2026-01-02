@@ -26,10 +26,8 @@ services:
       SRT_RCVBUF_BYTES: "25000000"
 
       # Transcode (use if sender doesn't repeat SPS/PPS)
-      VIDEO_CODEC: "libx264"
-      AUDIO_CODEC: "aac"
-      X264_PRESET: "veryfast"
-      X264_TUNE: "zerolatency"
+      VIDEO_CODEC: "copy"
+      AUDIO_CODEC: "copy"
     ports:
       - "9000:9000/udp"   # SRT input from sender
       - "8088:8088/tcp"   # health endpoint
