@@ -25,6 +25,11 @@ services:
       SRT_LATENCY_US: "200000"
       SRT_RCVBUF_BYTES: "25000000"
 
+      # Input probing/format override (use if ffmpeg mis-detects stream)
+      INPUT_FORMAT: "mpegts"
+      PROBE_SIZE: "10M"
+      ANALYZE_DURATION: "10M"
+
       # Transcode (use if sender doesn't repeat SPS/PPS)
       VIDEO_CODEC: "libx264"
       AUDIO_CODEC: "aac"

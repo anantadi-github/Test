@@ -19,6 +19,7 @@ import os
 import sys
 import time
 import signal
+import shlex
 import shutil
 import subprocess
 import threading
@@ -51,6 +52,12 @@ FORCE_KEYFRAMES = os.getenv("FORCE_KEYFRAMES", "true").lower() in ("1", "true", 
 # SRT tuning (start here; adjust only if needed)
 SRT_LATENCY_US = int(os.getenv("SRT_LATENCY_US", "200000"))        # 200ms
 SRT_RCVBUF_BYTES = int(os.getenv("SRT_RCVBUF_BYTES", "25000000"))  # 25MB
+
+# Input probing/format override (use if ffmpeg mis-detects stream)
+INPUT_FORMAT = os.getenv("INPUT_FORMAT", "")
+PROBE_SIZE = os.getenv("PROBE_SIZE", "")
+ANALYZE_DURATION = os.getenv("ANALYZE_DURATION", "")
+FFMPEG_INPUT_ARGS = os.getenv("FFMPEG_INPUT_ARGS", "")
 
 # Restart behavior
 RESTART_SLEEP_SEC = int(os.getenv("RESTART_SLEEP_SEC", "2"))
@@ -96,6 +103,19 @@ def check_ffmpeg():
 
 def playlist_path() -> str:
     return os.path.join(HLS_DIR, PLAYLIST_NAME)
+
+
+def build_input_args() -> list[str]:
+    args: list[str] = []
+    if ANALYZE_DURATION:
+        args += ["-analyzeduration", ANALYZE_DURATION]
+    if PROBE_SIZE:
+        args += ["-probesize", PROBE_SIZE]
+    if INPUT_FORMAT:
+        args += ["-f", INPUT_FORMAT]
+    if FFMPEG_INPUT_ARGS:
+        args += shlex.split(FFMPEG_INPUT_ARGS)
+    return args
 
 
 def build_codec_args() -> list[str]:
@@ -158,6 +178,9 @@ def build_ffmpeg_cmd() -> list[str]:
         # Helps when live timestamps are odd / missing
         "-fflags", "+genpts",
 
+    ]
+    cmd += build_input_args()
+    cmd += [
         "-i", srt_in,
     ]
     cmd += build_codec_args()
