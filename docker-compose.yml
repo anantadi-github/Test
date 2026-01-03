@@ -39,5 +39,7 @@ services:
       FORCE_KEYFRAMES: "false"
       X264_PRESET: "veryfast"
       X264_TUNE: "zerolatency"
+      UDP_HOST: "127.0.0.1"
+      UDP_PORT: "10000"
     ports:
       - "9000:9000/udp"

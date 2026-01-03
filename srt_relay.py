@@ -1,93 +1,49 @@
 #!/usr/bin/env python3
-"""
-SRT Listener -> HLS (m3u8) Gateway
----------------------------------
-- Listens on SRT port (INPUT_PORT)
-- Repackages to HLS (.m3u8 + .ts segments) in HLS_DIR
-- nginx can serve /hls/stream.m3u8
-- Auto-restarts ffmpeg if SRT drops / ffmpeg exits
-- Optional lightweight health endpoint (HTTP) for monitoring
-
-Sender (customer) pushes:
-  srt://<EC2_PUBLIC_IP>:9000?mode=caller
-
-Your ingestion pipeline pulls:
-  http://<EC2_PUBLIC_IP>/hls/stream.m3u8
-"""
-
-import os
-import sys
-import time
-import signal
-import shlex
-import shutil
-import subprocess
-import threading
+import os, sys, time, signal, shlex, shutil, subprocess, threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-# =========================
-# Config
-# =========================
 INPUT_PORT = int(os.getenv("INPUT_PORT", "9000"))
 
 HLS_DIR = os.getenv("HLS_DIR", "/var/www/html/hls")
 PLAYLIST_NAME = os.getenv("PLAYLIST_NAME", "stream.m3u8")
 
-# HLS behavior
-HLS_TIME_SEC = int(os.getenv("HLS_TIME_SEC", "2"))         # segment duration
-HLS_LIST_SIZE = int(os.getenv("HLS_LIST_SIZE", "6"))       # rolling window length
+HLS_TIME_SEC = int(os.getenv("HLS_TIME_SEC", "2"))
+HLS_LIST_SIZE = int(os.getenv("HLS_LIST_SIZE", "6"))
 HLS_DELETE_THRESHOLD = int(os.getenv("HLS_DELETE_THRESHOLD", "1"))
 
-# Transcoding / repackaging
-# For gateway: prefer VIDEO_CODEC=copy (no decode) + AUDIO_CODEC=aac for HLS compatibility
-VIDEO_CODEC = os.getenv("VIDEO_CODEC", "copy")  # "copy" or e.g. "libx264"
-AUDIO_CODEC = os.getenv("AUDIO_CODEC", "aac")   # "copy", "aac", or "none"
-X264_PRESET = os.getenv("X264_PRESET", "veryfast")
-X264_TUNE = os.getenv("X264_TUNE", "zerolatency")
-VIDEO_CRF = os.getenv("VIDEO_CRF", "")          # e.g. "23"
-VIDEO_BITRATE = os.getenv("VIDEO_BITRATE", "")  # e.g. "2500k"
-AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")  # default for aac
-FORCE_KEYFRAMES = os.getenv("FORCE_KEYFRAMES", "false").lower() in ("1", "true", "yes")
+# Audio for HLS
+AUDIO_CODEC = os.getenv("AUDIO_CODEC", "aac")   # aac safest
+AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")
 
-# SRT tuning (WAN-safe defaults)
-SRT_LATENCY_US = int(os.getenv("SRT_LATENCY_US", "800000"))         # 800ms
-SRT_RCVBUF_BYTES = int(os.getenv("SRT_RCVBUF_BYTES", "268435456"))  # 256MB
+# SRT tuning
+SRT_LATENCY_US = int(os.getenv("SRT_LATENCY_US", "800000"))
+SRT_RCVBUF_BYTES = int(os.getenv("SRT_RCVBUF_BYTES", "268435456"))
+SRT_TRANSTYPE = os.getenv("SRT_TRANSTYPE", "live")
+SRT_PKT_SIZE = int(os.getenv("SRT_PKT_SIZE", "1316"))
 
-# Common for MPEG-TS over SRT (most encoders)
-SRT_TRANSTYPE = os.getenv("SRT_TRANSTYPE", "live")   # live/file
-SRT_PKT_SIZE = int(os.getenv("SRT_PKT_SIZE", "1316"))  # typical TS packet payload size
+# Probe
+PROBE_SIZE = os.getenv("PROBE_SIZE", "20M")
+ANALYZE_DURATION = os.getenv("ANALYZE_DURATION", "20M")
 
-# Input probing/format override (use if ffmpeg mis-detects stream)
-INPUT_FORMAT = os.getenv("INPUT_FORMAT", "mpegts")
-PROBE_SIZE = os.getenv("PROBE_SIZE", "5M")
-ANALYZE_DURATION = os.getenv("ANALYZE_DURATION", "5M")
-FFMPEG_INPUT_ARGS = os.getenv("FFMPEG_INPUT_ARGS", "")
+# Local UDP hop (inside container)
+UDP_HOST = os.getenv("UDP_HOST", "127.0.0.1")
+UDP_PORT = int(os.getenv("UDP_PORT", "10000"))
 
-# Restart behavior
 RESTART_SLEEP_SEC = int(os.getenv("RESTART_SLEEP_SEC", "2"))
 
-# Optional health endpoint
 HEALTH_PORT = int(os.getenv("HEALTH_PORT", "8088"))
 HEALTH_MAX_STALENESS_SEC = int(os.getenv("HEALTH_MAX_STALENESS_SEC", "10"))
-
-# Cleanup on start
 CLEANUP_ON_START = os.getenv("CLEANUP_ON_START", "true").lower() in ("1", "true", "yes")
 
 STOP_EVENT = threading.Event()
 
-
-# =========================
-# Utilities
-# =========================
 def log(msg: str):
     ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{ts}] {msg}", flush=True)
 
-
 def ensure_dirs():
     os.makedirs(HLS_DIR, exist_ok=True)
-
 
 def cleanup_hls_dir():
     if not os.path.isdir(HLS_DIR):
@@ -99,72 +55,16 @@ def cleanup_hls_dir():
             except Exception:
                 pass
 
-
 def check_ffmpeg():
     if shutil.which("ffmpeg") is None:
-        log("ERROR: ffmpeg not found in PATH. Install it first.")
+        log("ERROR: ffmpeg not found in PATH.")
         sys.exit(1)
 
-
-def playlist_path() -> str:
+def playlist_path():
     return os.path.join(HLS_DIR, PLAYLIST_NAME)
 
-
-def build_input_args() -> list[str]:
-    args: list[str] = []
-    if ANALYZE_DURATION:
-        args += ["-analyzeduration", str(ANALYZE_DURATION)]
-    if PROBE_SIZE:
-        args += ["-probesize", str(PROBE_SIZE)]
-    if INPUT_FORMAT:
-        args += ["-f", INPUT_FORMAT]
-    if FFMPEG_INPUT_ARGS:
-        args += shlex.split(FFMPEG_INPUT_ARGS)
-    return args
-
-
-def build_codec_args() -> list[str]:
-    args: list[str] = []
-
-    # Video
-    if VIDEO_CODEC == "copy":
-        args += ["-c:v", "copy"]
-    else:
-        args += ["-c:v", VIDEO_CODEC]
-        if VIDEO_CODEC == "libx264":
-            args += ["-preset", X264_PRESET, "-tune", X264_TUNE]
-            # Repeat SPS/PPS in output (good for HLS robustness)
-            args += ["-x264-params", "repeat-headers=1"]
-        if VIDEO_CODEC in ("libx264", "libx265") and VIDEO_CRF:
-            args += ["-crf", VIDEO_CRF]
-        if VIDEO_BITRATE:
-            args += ["-b:v", VIDEO_BITRATE]
-        if FORCE_KEYFRAMES:
-            # align keyframes to segment duration
-            args += ["-force_key_frames", f"expr:gte(t,n_forced*{HLS_TIME_SEC})"]
-
-    # Audio
-    audio_codec = AUDIO_CODEC.lower()
-    if audio_codec in ("none", "disable", "disabled", "no"):
-        args += ["-an"]
-    elif audio_codec == "copy":
-        args += ["-c:a", "copy"]
-    else:
-        args += ["-c:a", AUDIO_CODEC]
-        if AUDIO_BITRATE:
-            args += ["-b:a", AUDIO_BITRATE]
-        # These help some HLS players; harmless if input already matches
-        args += ["-ar", "48000", "-ac", "2"]
-
-    return args
-
-
-def build_ffmpeg_cmd() -> list[str]:
-    """
-    Repackage (or transcode) SRT listener -> HLS
-    """
-    # SRT listener URL
-    srt_in = (
+def build_srt_url():
+    return (
         f"srt://0.0.0.0:{INPUT_PORT}"
         f"?mode=listener"
         f"&transtype={SRT_TRANSTYPE}"
@@ -173,36 +73,75 @@ def build_ffmpeg_cmd() -> list[str]:
         f"&rcvbuf={SRT_RCVBUF_BYTES}"
     )
 
-    seg_pattern = os.path.join(HLS_DIR, "seg_%Y%m%d_%H%M%S.ts")
+def build_cmd_srt_to_udp():
+    # SRT -> UDP MPEGTS (NO DECODE)
+    srt_in = build_srt_url()
+    udp_out = f"udp://{UDP_HOST}:{UDP_PORT}?pkt_size=1316&buffer_size=6553600&fifo_size=5000000&overrun_nonfatal=1"
 
-    # HLS flags:
-    # - delete_segments: disk remains bounded
-    # - append_list: stable rolling playlist updates
-    # - independent_segments: better seeking/robustness
-    # - program_date_time: useful timestamps
-    # - temp_file: atomic-ish writes
+    return [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "warning",
+        "-nostdin",
+
+        # be tolerant
+        "-fflags", "+genpts+discardcorrupt",
+        "-err_detect", "ignore_err",
+
+        # probe more so it locks properly
+        "-analyzeduration", ANALYZE_DURATION,
+        "-probesize", PROBE_SIZE,
+
+        "-f", "mpegts",
+        "-i", srt_in,
+
+        # important: don't decode
+        "-c", "copy",
+
+        # force mux as mpegts
+        "-f", "mpegts",
+        "-mpegts_flags", "+resend_headers+initial_discontinuity",
+
+        udp_out
+    ]
+
+def build_cmd_udp_to_hls():
+    # UDP MPEGTS -> HLS (copy video, aac audio)
+    udp_in = f"udp://{UDP_HOST}:{UDP_PORT}?fifo_size=5000000&overrun_nonfatal=1&timeout=5000000"
+
+    seg_pattern = os.path.join(HLS_DIR, "seg_%Y%m%d_%H%M%S.ts")
     hls_flags = "delete_segments+append_list+independent_segments+program_date_time+temp_file"
 
     cmd = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "warning",
+        "-nostdin",
 
-        # tolerate imperfect live inputs
         "-fflags", "+genpts+discardcorrupt",
         "-err_detect", "ignore_err",
 
-        # avoid stdin blocking in containers
-        "-nostdin",
+        "-analyzeduration", ANALYZE_DURATION,
+        "-probesize", PROBE_SIZE,
+
+        "-f", "mpegts",
+        "-i", udp_in,
+
+        "-map", "0:v:0",
+        "-map", "0:a?",
+
+        # Video stays copy (no decode)
+        "-c:v", "copy",
     ]
 
-    cmd += build_input_args()
-    cmd += ["-i", srt_in]
+    # Audio for HLS
+    if AUDIO_CODEC.lower() in ("none", "no", "disable"):
+        cmd += ["-an"]
+    elif AUDIO_CODEC.lower() == "copy":
+        cmd += ["-c:a", "copy"]
+    else:
+        cmd += ["-c:a", "aac", "-b:a", AUDIO_BITRATE, "-ar", "48000", "-ac", "2"]
 
-    # If stream contains multiple tracks, map first video + optional audio
-    cmd += ["-map", "0:v:0", "-map", "0:a?"]
-
-    cmd += build_codec_args()
     cmd += [
         "-f", "hls",
         "-hls_time", str(HLS_TIME_SEC),
@@ -214,17 +153,10 @@ def build_ffmpeg_cmd() -> list[str]:
     ]
     return cmd
 
-
-# =========================
-# Health Server
-# =========================
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path not in ("/healthz", "/health", "/"):
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b"not found")
-            return
+            self.send_response(404); self.end_headers(); self.wfile.write(b"not found"); return
 
         p = playlist_path()
         ok = False
@@ -240,11 +172,8 @@ class HealthHandler(BaseHTTPRequestHandler):
         self.send_response(200 if ok else 503)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
-
         body = {
-            "ok": ok,
-            "playlist": p,
-            "exists": exists,
+            "ok": ok, "playlist": p, "exists": exists,
             "playlist_age_sec": None if age is None else round(age, 3),
             "max_staleness_sec": HEALTH_MAX_STALENESS_SEC,
         }
@@ -253,7 +182,6 @@ class HealthHandler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
-
 def start_health_server():
     server = HTTPServer(("0.0.0.0", HEALTH_PORT), HealthHandler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
@@ -261,52 +189,69 @@ def start_health_server():
     log(f"[HEALTH] listening on http://0.0.0.0:{HEALTH_PORT}/healthz")
     return server
 
+def pump_logs(prefix, proc):
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        if STOP_EVENT.is_set():
+            break
+        log(f"{prefix} {line.rstrip()}")
 
-# =========================
-# Runner
-# =========================
 def run_forever():
     while not STOP_EVENT.is_set():
-        cmd = build_ffmpeg_cmd()
-        log("[SRT->HLS] starting ffmpeg:")
-        log("  " + " ".join(cmd))
+        cmd1 = build_cmd_srt_to_udp()
+        cmd2 = build_cmd_udp_to_hls()
 
+        log("[SRT->UDP] starting ffmpeg:")
+        log("  " + " ".join(cmd1))
+        log("[UDP->HLS] starting ffmpeg:")
+        log("  " + " ".join(cmd2))
+
+        p1 = p2 = None
         try:
-            proc = subprocess.Popen(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,
-            )
+            p1 = subprocess.Popen(cmd1, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+            p2 = subprocess.Popen(cmd2, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
 
-            assert proc.stdout is not None
-            for line in proc.stdout:
-                if STOP_EVENT.is_set():
+            t1 = threading.Thread(target=pump_logs, args=("[ffmpeg:SRT->UDP]", p1), daemon=True)
+            t2 = threading.Thread(target=pump_logs, args=("[ffmpeg:UDP->HLS]", p2), daemon=True)
+            t1.start(); t2.start()
+
+            # If either exits, restart both (clean state)
+            while not STOP_EVENT.is_set():
+                rc1 = p1.poll()
+                rc2 = p2.poll()
+                if rc1 is not None or rc2 is not None:
+                    log(f"[PIPELINE] exited (srt->udp={rc1}, udp->hls={rc2}). Restarting in {RESTART_SLEEP_SEC}s...")
                     break
-                log(f"[ffmpeg] {line.rstrip()}")
-
-            if STOP_EVENT.is_set():
-                break
-
-            rc = proc.wait()
-            log(f"[SRT->HLS] ffmpeg exited (code={rc}). Restarting in {RESTART_SLEEP_SEC}s...")
+                time.sleep(1)
 
         except Exception as e:
-            log(f"[SRT->HLS] ERROR: {e}. Restarting in {RESTART_SLEEP_SEC}s...")
+            log(f"[PIPELINE] ERROR: {e}. Restarting in {RESTART_SLEEP_SEC}s...")
+
+        finally:
+            for p in (p1, p2):
+                try:
+                    if p and p.poll() is None:
+                        p.terminate()
+                except Exception:
+                    pass
+            time.sleep(0.5)
+            for p in (p1, p2):
+                try:
+                    if p and p.poll() is None:
+                        p.kill()
+                except Exception:
+                    pass
 
         for _ in range(RESTART_SLEEP_SEC):
             if STOP_EVENT.is_set():
                 break
             time.sleep(1)
 
-    log("[SRT->HLS] stopped.")
-
+    log("[PIPELINE] stopped.")
 
 def handle_signal(signum, frame):
     log("Signal received, stopping...")
     STOP_EVENT.set()
-
 
 def main():
     signal.signal(signal.SIGINT, handle_signal)
@@ -321,7 +266,7 @@ def main():
 
     public_ip = os.getenv("PUBLIC_IP", "<EC2_PUBLIC_IP_OR_DOMAIN>")
     log("=" * 70)
-    log("SRT LISTENER  ->  HLS (.m3u8) GATEWAY")
+    log("SRT LISTENER  ->  UDP  ->  HLS (.m3u8) GATEWAY")
     log("=" * 70)
     log(f"SRT INPUT (sender pushes):   srt://{public_ip}:{INPUT_PORT}?mode=caller")
     log(f"HLS OUTPUT (ingestion pulls): http://{public_ip}/hls/{PLAYLIST_NAME}")
@@ -335,7 +280,6 @@ def main():
     except Exception:
         pass
     log("Shutdown complete.")
-
 
 if __name__ == "__main__":
     main()
