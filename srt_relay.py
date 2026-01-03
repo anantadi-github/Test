@@ -181,7 +181,7 @@ def build_ffmpeg_cmd() -> list[str]:
         f"&rcvbuf={SRT_RCVBUF_BYTES}"
     )
 
-    seg_pattern = os.path.join(HLS_DIR, "seg_%Y%m%d_%H%M%S.ts")
+    seg_pattern = os.path.join(HLS_DIR, "seg_%06d.ts")
     hls_flags = "delete_segments+append_list+independent_segments+program_date_time+temp_file"
 
     cmd = [
