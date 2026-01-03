@@ -44,5 +44,10 @@ services:
       X264_TUNE: "zerolatency"
       UDP_HOST: "127.0.0.1"
       UDP_PORT: "10000"
+      PRIVATE_PLAYLIST: "stream.m3u8"
+      PUBLIC_PLAYLIST: "live.m3u8"
+      PUBLISH_STABLE_SECONDS: "8"
+      REQUIRE_SEGMENTS: "2"
+      FFPROBE_VALIDATE: "true"
     ports:
       - "9000:9000/udp"
