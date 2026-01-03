@@ -37,7 +37,10 @@ services:
 
       # Ignored when VIDEO_CODEC=copy
       FORCE_KEYFRAMES: "false"
-      X264_PRESET: "veryfast"
+      
+      UDP_HOST: "127.0.0.1"
+      VIDEO_CRF: "23"
+      X264_PRESET: "superfast"
       X264_TUNE: "zerolatency"
       UDP_HOST: "127.0.0.1"
       UDP_PORT: "10000"

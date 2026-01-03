@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-import os, sys, time, signal, shlex, shutil, subprocess, threading
+import os, sys, time, signal, shutil, subprocess, threading
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
@@ -11,10 +11,6 @@ PLAYLIST_NAME = os.getenv("PLAYLIST_NAME", "stream.m3u8")
 HLS_TIME_SEC = int(os.getenv("HLS_TIME_SEC", "2"))
 HLS_LIST_SIZE = int(os.getenv("HLS_LIST_SIZE", "6"))
 HLS_DELETE_THRESHOLD = int(os.getenv("HLS_DELETE_THRESHOLD", "1"))
-
-# Audio for HLS
-AUDIO_CODEC = os.getenv("AUDIO_CODEC", "aac")   # aac safest
-AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")
 
 # SRT tuning
 SRT_LATENCY_US = int(os.getenv("SRT_LATENCY_US", "800000"))
@@ -29,6 +25,16 @@ ANALYZE_DURATION = os.getenv("ANALYZE_DURATION", "20M")
 # Local UDP hop (inside container)
 UDP_HOST = os.getenv("UDP_HOST", "127.0.0.1")
 UDP_PORT = int(os.getenv("UDP_PORT", "10000"))
+
+# Video transcode settings (stage-1)
+X264_PRESET = os.getenv("X264_PRESET", "veryfast")
+X264_TUNE = os.getenv("X264_TUNE", "zerolatency")
+VIDEO_BITRATE = os.getenv("VIDEO_BITRATE", "")   # e.g. 2500k
+VIDEO_CRF = os.getenv("VIDEO_CRF", "23")         # good default
+
+# Audio for HLS
+AUDIO_CODEC = os.getenv("AUDIO_CODEC", "aac")    # aac safest
+AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")
 
 RESTART_SLEEP_SEC = int(os.getenv("RESTART_SLEEP_SEC", "2"))
 
@@ -74,43 +80,12 @@ def build_srt_url():
     )
 
 def build_cmd_srt_to_udp():
-    # SRT -> UDP MPEGTS (NO DECODE)
+    """
+    Stage-1: SRT(mpegts) -> UDP(mpegts)
+    We TRANSCODE VIDEO here so SPS/PPS is guaranteed (repeat-headers=1).
+    """
     srt_in = build_srt_url()
     udp_out = f"udp://{UDP_HOST}:{UDP_PORT}?pkt_size=1316&buffer_size=6553600&fifo_size=5000000&overrun_nonfatal=1"
-
-    return [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel", "warning",
-        "-nostdin",
-
-        # be tolerant
-        "-fflags", "+genpts+discardcorrupt",
-        "-err_detect", "ignore_err",
-
-        # probe more so it locks properly
-        "-analyzeduration", ANALYZE_DURATION,
-        "-probesize", PROBE_SIZE,
-
-        "-f", "mpegts",
-        "-i", srt_in,
-
-        # important: don't decode
-        "-c", "copy",
-
-        # force mux as mpegts
-        "-f", "mpegts",
-        "-mpegts_flags", "+resend_headers+initial_discontinuity",
-
-        udp_out
-    ]
-
-def build_cmd_udp_to_hls():
-    # UDP MPEGTS -> HLS (copy video, aac audio)
-    udp_in = f"udp://{UDP_HOST}:{UDP_PORT}?fifo_size=5000000&overrun_nonfatal=1&timeout=5000000"
-
-    seg_pattern = os.path.join(HLS_DIR, "seg_%Y%m%d_%H%M%S.ts")
-    hls_flags = "delete_segments+append_list+independent_segments+program_date_time+temp_file"
 
     cmd = [
         "ffmpeg",
@@ -125,16 +100,70 @@ def build_cmd_udp_to_hls():
         "-probesize", PROBE_SIZE,
 
         "-f", "mpegts",
+        "-i", srt_in,
+
+        # video transcode (fix SPS/PPS forever)
+        "-map", "0:v:0",
+        "-map", "0:a?",
+        "-c:v", "libx264",
+        "-preset", X264_PRESET,
+        "-tune", X264_TUNE,
+        "-pix_fmt", "yuv420p",
+        "-x264-params", "repeat-headers=1:keyint=60:min-keyint=60:scenecut=0",
+
+        # control quality
+    ]
+
+    if VIDEO_BITRATE:
+        cmd += ["-b:v", VIDEO_BITRATE]
+    else:
+        cmd += ["-crf", VIDEO_CRF]
+
+    # audio: keep light; if source audio is weird, re-encode to AAC
+    cmd += [
+        "-c:a", "aac",
+        "-b:a", AUDIO_BITRATE,
+        "-ar", "48000",
+        "-ac", "2",
+
+        # mux to mpegts + resend headers
+        "-f", "mpegts",
+        "-mpegts_flags", "+resend_headers+initial_discontinuity",
+
+        udp_out
+    ]
+    return cmd
+
+def build_cmd_udp_to_hls():
+    """
+    Stage-2: UDP(mpegts) -> HLS
+    Video is now clean H.264 (with repeated headers), so we COPY it.
+    """
+    udp_in = f"udp://{UDP_HOST}:{UDP_PORT}?fifo_size=5000000&overrun_nonfatal=1&timeout=5000000"
+
+    seg_pattern = os.path.join(HLS_DIR, "seg_%Y%m%d_%H%M%S.ts")
+    hls_flags = "delete_segments+append_list+independent_segments+program_date_time+temp_file"
+
+    cmd = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel", "warning",
+        "-nostdin",
+
+        "-fflags", "+genpts+discardcorrupt",
+        "-err_detect", "ignore_err",
+        "-analyzeduration", ANALYZE_DURATION,
+        "-probesize", PROBE_SIZE,
+
+        "-f", "mpegts",
         "-i", udp_in,
 
         "-map", "0:v:0",
         "-map", "0:a?",
-
-        # Video stays copy (no decode)
         "-c:v", "copy",
     ]
 
-    # Audio for HLS
+    # audio for HLS
     if AUDIO_CODEC.lower() in ("none", "no", "disable"):
         cmd += ["-an"]
     elif AUDIO_CODEC.lower() == "copy":
@@ -215,7 +244,6 @@ def run_forever():
             t2 = threading.Thread(target=pump_logs, args=("[ffmpeg:UDP->HLS]", p2), daemon=True)
             t1.start(); t2.start()
 
-            # If either exits, restart both (clean state)
             while not STOP_EVENT.is_set():
                 rc1 = p1.poll()
                 rc2 = p2.poll()
@@ -266,7 +294,7 @@ def main():
 
     public_ip = os.getenv("PUBLIC_IP", "<EC2_PUBLIC_IP_OR_DOMAIN>")
     log("=" * 70)
-    log("SRT LISTENER  ->  UDP  ->  HLS (.m3u8) GATEWAY")
+    log("SRT LISTENER  ->  UDP  ->  HLS (.m3u8) GATEWAY (VIDEO TRANSCODE FIX)")
     log("=" * 70)
     log(f"SRT INPUT (sender pushes):   srt://{public_ip}:{INPUT_PORT}?mode=caller")
     log(f"HLS OUTPUT (ingestion pulls): http://{public_ip}/hls/{PLAYLIST_NAME}")
