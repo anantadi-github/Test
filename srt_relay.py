@@ -4,7 +4,7 @@ SRT Listener -> HLS (m3u8) Gateway
 ---------------------------------
 - Listens on SRT port (INPUT_PORT)
 - Repackages to HLS (.m3u8 + .ts segments) in HLS_DIR
-- nginx can serve /var/www/html/hls/stream.m3u8
+- nginx can serve /hls/stream.m3u8
 - Auto-restarts ffmpeg if SRT drops / ffmpeg exits
 - Optional lightweight health endpoint (HTTP) for monitoring
 
@@ -39,24 +39,29 @@ HLS_TIME_SEC = int(os.getenv("HLS_TIME_SEC", "2"))         # segment duration
 HLS_LIST_SIZE = int(os.getenv("HLS_LIST_SIZE", "6"))       # rolling window length
 HLS_DELETE_THRESHOLD = int(os.getenv("HLS_DELETE_THRESHOLD", "1"))
 
-# Transcoding (use when sender doesn't repeat SPS/PPS)
+# Transcoding / repackaging
+# For gateway: prefer VIDEO_CODEC=copy (no decode) + AUDIO_CODEC=aac for HLS compatibility
 VIDEO_CODEC = os.getenv("VIDEO_CODEC", "copy")  # "copy" or e.g. "libx264"
-AUDIO_CODEC = os.getenv("AUDIO_CODEC", "copy")  # "copy", "aac", or "none"
+AUDIO_CODEC = os.getenv("AUDIO_CODEC", "aac")   # "copy", "aac", or "none"
 X264_PRESET = os.getenv("X264_PRESET", "veryfast")
 X264_TUNE = os.getenv("X264_TUNE", "zerolatency")
 VIDEO_CRF = os.getenv("VIDEO_CRF", "")          # e.g. "23"
 VIDEO_BITRATE = os.getenv("VIDEO_BITRATE", "")  # e.g. "2500k"
-AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "")  # e.g. "128k"
-FORCE_KEYFRAMES = os.getenv("FORCE_KEYFRAMES", "true").lower() in ("1", "true", "yes")
+AUDIO_BITRATE = os.getenv("AUDIO_BITRATE", "128k")  # default for aac
+FORCE_KEYFRAMES = os.getenv("FORCE_KEYFRAMES", "false").lower() in ("1", "true", "yes")
 
-# SRT tuning (start here; adjust only if needed)
-SRT_LATENCY_US = int(os.getenv("SRT_LATENCY_US", "200000"))        # 200ms
-SRT_RCVBUF_BYTES = int(os.getenv("SRT_RCVBUF_BYTES", "25000000"))  # 25MB
+# SRT tuning (WAN-safe defaults)
+SRT_LATENCY_US = int(os.getenv("SRT_LATENCY_US", "800000"))         # 800ms
+SRT_RCVBUF_BYTES = int(os.getenv("SRT_RCVBUF_BYTES", "268435456"))  # 256MB
+
+# Common for MPEG-TS over SRT (most encoders)
+SRT_TRANSTYPE = os.getenv("SRT_TRANSTYPE", "live")   # live/file
+SRT_PKT_SIZE = int(os.getenv("SRT_PKT_SIZE", "1316"))  # typical TS packet payload size
 
 # Input probing/format override (use if ffmpeg mis-detects stream)
-INPUT_FORMAT = os.getenv("INPUT_FORMAT", "")
-PROBE_SIZE = os.getenv("PROBE_SIZE", "")
-ANALYZE_DURATION = os.getenv("ANALYZE_DURATION", "")
+INPUT_FORMAT = os.getenv("INPUT_FORMAT", "mpegts")
+PROBE_SIZE = os.getenv("PROBE_SIZE", "5M")
+ANALYZE_DURATION = os.getenv("ANALYZE_DURATION", "5M")
 FFMPEG_INPUT_ARGS = os.getenv("FFMPEG_INPUT_ARGS", "")
 
 # Restart behavior
@@ -108,9 +113,9 @@ def playlist_path() -> str:
 def build_input_args() -> list[str]:
     args: list[str] = []
     if ANALYZE_DURATION:
-        args += ["-analyzeduration", ANALYZE_DURATION]
+        args += ["-analyzeduration", str(ANALYZE_DURATION)]
     if PROBE_SIZE:
-        args += ["-probesize", PROBE_SIZE]
+        args += ["-probesize", str(PROBE_SIZE)]
     if INPUT_FORMAT:
         args += ["-f", INPUT_FORMAT]
     if FFMPEG_INPUT_ARGS:
@@ -121,20 +126,24 @@ def build_input_args() -> list[str]:
 def build_codec_args() -> list[str]:
     args: list[str] = []
 
+    # Video
     if VIDEO_CODEC == "copy":
         args += ["-c:v", "copy"]
     else:
         args += ["-c:v", VIDEO_CODEC]
         if VIDEO_CODEC == "libx264":
             args += ["-preset", X264_PRESET, "-tune", X264_TUNE]
+            # Repeat SPS/PPS in output (good for HLS robustness)
             args += ["-x264-params", "repeat-headers=1"]
         if VIDEO_CODEC in ("libx264", "libx265") and VIDEO_CRF:
             args += ["-crf", VIDEO_CRF]
         if VIDEO_BITRATE:
             args += ["-b:v", VIDEO_BITRATE]
         if FORCE_KEYFRAMES:
+            # align keyframes to segment duration
             args += ["-force_key_frames", f"expr:gte(t,n_forced*{HLS_TIME_SEC})"]
 
+    # Audio
     audio_codec = AUDIO_CODEC.lower()
     if audio_codec in ("none", "disable", "disabled", "no"):
         args += ["-an"]
@@ -144,6 +153,8 @@ def build_codec_args() -> list[str]:
         args += ["-c:a", AUDIO_CODEC]
         if AUDIO_BITRATE:
             args += ["-b:a", AUDIO_BITRATE]
+        # These help some HLS players; harmless if input already matches
+        args += ["-ar", "48000", "-ac", "2"]
 
     return args
 
@@ -156,33 +167,41 @@ def build_ffmpeg_cmd() -> list[str]:
     srt_in = (
         f"srt://0.0.0.0:{INPUT_PORT}"
         f"?mode=listener"
+        f"&transtype={SRT_TRANSTYPE}"
+        f"&pkt_size={SRT_PKT_SIZE}"
         f"&latency={SRT_LATENCY_US}"
         f"&rcvbuf={SRT_RCVBUF_BYTES}"
     )
 
-    # Segment filename pattern (strftime supported by ffmpeg for -hls_segment_filename)
     seg_pattern = os.path.join(HLS_DIR, "seg_%Y%m%d_%H%M%S.ts")
 
     # HLS flags:
     # - delete_segments: disk remains bounded
     # - append_list: stable rolling playlist updates
     # - independent_segments: better seeking/robustness
-    # - temp_file: atomic-ish writes (helps ingestion avoid partial playlist reads)
-    hls_flags = "delete_segments+append_list+independent_segments+temp_file"
+    # - program_date_time: useful timestamps
+    # - temp_file: atomic-ish writes
+    hls_flags = "delete_segments+append_list+independent_segments+program_date_time+temp_file"
 
     cmd = [
         "ffmpeg",
         "-hide_banner",
         "-loglevel", "warning",
 
-        # Helps when live timestamps are odd / missing
-        "-fflags", "+genpts",
+        # tolerate imperfect live inputs
+        "-fflags", "+genpts+discardcorrupt",
+        "-err_detect", "ignore_err",
 
+        # avoid stdin blocking in containers
+        "-nostdin",
     ]
+
     cmd += build_input_args()
-    cmd += [
-        "-i", srt_in,
-    ]
+    cmd += ["-i", srt_in]
+
+    # If stream contains multiple tracks, map first video + optional audio
+    cmd += ["-map", "0:v:0", "-map", "0:a?"]
+
     cmd += build_codec_args()
     cmd += [
         "-f", "hls",
@@ -191,7 +210,6 @@ def build_ffmpeg_cmd() -> list[str]:
         "-hls_delete_threshold", str(HLS_DELETE_THRESHOLD),
         "-hls_flags", hls_flags,
         "-hls_segment_filename", seg_pattern,
-
         playlist_path(),
     ]
     return cmd
@@ -219,10 +237,7 @@ class HealthHandler(BaseHTTPRequestHandler):
             except Exception:
                 ok = False
 
-        if ok:
-            self.send_response(200)
-        else:
-            self.send_response(503)
+        self.send_response(200 if ok else 503)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
 
@@ -235,7 +250,6 @@ class HealthHandler(BaseHTTPRequestHandler):
         }
         self.wfile.write((str(body).replace("'", '"')).encode("utf-8"))
 
-    # Quiet logs
     def log_message(self, format, *args):
         return
 
@@ -281,7 +295,6 @@ def run_forever():
         except Exception as e:
             log(f"[SRT->HLS] ERROR: {e}. Restarting in {RESTART_SLEEP_SEC}s...")
 
-        # backoff before restart
         for _ in range(RESTART_SLEEP_SEC):
             if STOP_EVENT.is_set():
                 break
@@ -304,7 +317,6 @@ def main():
     if CLEANUP_ON_START:
         cleanup_hls_dir()
 
-    # Start health server (optional but useful)
     health_server = start_health_server()
 
     public_ip = os.getenv("PUBLIC_IP", "<EC2_PUBLIC_IP_OR_DOMAIN>")
@@ -318,7 +330,6 @@ def main():
 
     run_forever()
 
-    # graceful shutdown
     try:
         health_server.shutdown()
     except Exception:

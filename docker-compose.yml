@@ -8,10 +8,8 @@ services:
     container_name: srt2hls
     restart: unless-stopped
     environment:
-      # For log prints only (optional)
       PUBLIC_IP: "${PUBLIC_IP:-<EC2_PUBLIC_IP_OR_DOMAIN>}"
 
-      # Script config (optional overrides)
       INPUT_PORT: "9000"
       HLS_DIR: "/var/www/html/hls"
       PLAYLIST_NAME: "stream.m3u8"
@@ -21,38 +19,25 @@ services:
       HEALTH_MAX_STALENESS_SEC: "10"
       CLEANUP_ON_START: "true"
 
-      # SRT tuning (only change if needed)
-      SRT_LATENCY_US: "200000"
-      SRT_RCVBUF_BYTES: "25000000"
+      # SRT tuning (WAN-safe defaults)
+      SRT_LATENCY_US: "800000"          # 800ms
+      SRT_RCVBUF_BYTES: "268435456"     # 256MB
 
-      # Input probing/format override (use if ffmpeg mis-detects stream)
+      # Input probing/format override
       INPUT_FORMAT: "mpegts"
-      PROBE_SIZE: "10M"
-      ANALYZE_DURATION: "10M"
+      PROBE_SIZE: "5M"
+      ANALYZE_DURATION: "5M"
 
-      # Transcode (use if sender doesn't repeat SPS/PPS)
-      VIDEO_CODEC: "libx264"
+      # ✅ Copy video (no decode)
+      VIDEO_CODEC: "copy"
+
+      # ✅ Make HLS audio safe
       AUDIO_CODEC: "aac"
+      AUDIO_BITRATE: "128k"
+
+      # Ignored when VIDEO_CODEC=copy
+      FORCE_KEYFRAMES: "false"
       X264_PRESET: "veryfast"
       X264_TUNE: "zerolatency"
-      FORCE_KEYFRAMES: "true"
     ports:
-      - "9000:9000/udp"   # SRT input from sender
-      - "8088:8088/tcp"   # health endpoint
-    volumes:
-      - hls_data:/var/www/html/hls
-
-  nginx:
-    image: nginx:alpine
-    container_name: hls-nginx
-    restart: unless-stopped
-    depends_on:
-      - srt2hls
-    ports:
-      - "80:80/tcp"       # HLS served here
-    volumes:
-      - hls_data:/usr/share/nginx/html/hls:ro
-      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
-
-volumes:
-  hls_data:
+      - "9000:9000/udp"
